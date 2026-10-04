@@ -22,7 +22,9 @@ const ENV_WINDOW_SEC: f64 = 0.046;
 const ENV_DETREND_SEC: f64 = 1.0;
 const LOW_BAND_HZ: f64 = 150.0;
 const FOLD_BIN_SEC: f64 = 0.0025;
-const NOVELTY_BANDS: usize = 24;
+const BANDS: usize = 24;
+const PITCH_WINDOW_SEC: f64 = 0.186;
+const PITCH_HOP_SEC: f64 = 0.0116;
 const MACRO_BANDS: usize = 4;
 const TEMPO_POOL: usize = 5;
 const TEMPO_MATCH_REL: f64 = 2e-3;
@@ -77,9 +79,9 @@ pub struct GridEstimate {
     /// Time of the first detected measure start (4/4 assumed), within the
     /// first four beats.
     pub first_downbeat_sec: f64,
-    /// Novelty share of the chosen downbeat among the 4 rotations (0.25 = no
-    /// preference).
-    pub downbeat_share: f64,
+    /// How far the chosen measure rotation beats the runner-up (summed
+    /// z-scores of the harmonic-change and kick cues; ~0 means a toss-up).
+    pub downbeat_margin: f64,
     /// Bias of the final grid as measured by the bias kernel.
     pub bias_ms: f64,
     pub confidence: f64,
@@ -187,13 +189,12 @@ pub fn detect_grid(
         }
     }
 
-    let novelty = novelty_curve(&env, grid.period);
-    let (rotation, downbeat_share) = choose_downbeat(&env, &novelty, grid);
+    let (rotation, downbeat_margin) = choose_downbeat(audio_mono, sample_rate_hz, &env, grid);
     Ok(GridEstimate {
         bpm: grid.bpm(),
         first_beat_sec: grid.phase,
         first_downbeat_sec: grid.phase + rotation as f64 * grid.period,
-        downbeat_share,
+        downbeat_margin,
         bias_ms: est.bias_ms,
         confidence: est.confidence,
         snapped,
@@ -232,9 +233,6 @@ struct Envelope {
     low: Vec<f64>,
     /// Detrended onset flux in four macro bands (low to high).
     macro_flux: Vec<Vec<f64>>,
-    /// Per-frame log band energies (`NOVELTY_BANDS` per frame), for
-    /// section-change novelty.
-    bands: Vec<f32>,
     hop_sec: f64,
     /// Time of `values[0]`.
     t0_sec: f64,
@@ -268,7 +266,7 @@ fn onset_envelope(audio: &[f32], sample_rate_hz: u32) -> Result<Envelope, String
     let mut flux = Vec::with_capacity(frames);
     let mut low_flux = Vec::with_capacity(frames);
     let band_edges = band_edges(sr, n, max_bin);
-    let mut bands = Vec::with_capacity(frames * NOVELTY_BANDS);
+    let mut bands = Vec::with_capacity(frames * BANDS);
     for f in 0..frames {
         let start = f * hop;
         for (i, b) in buf.iter_mut().enumerate() {
@@ -297,7 +295,6 @@ fn onset_envelope(audio: &[f32], sample_rate_hz: u32) -> Result<Envelope, String
         values: detrend(&flux, (ENV_DETREND_SEC / hop_sec * 0.5) as usize),
         low: detrend(&low_flux, (ENV_DETREND_SEC / hop_sec * 0.5) as usize),
         macro_flux: macro_flux(&bands, (ENV_DETREND_SEC / hop_sec * 0.5) as usize),
-        bands,
         hop_sec,
         // Flux at frame f compares frames f-1 and f; attribute it to the
         // midpoint of their window centers.
@@ -306,8 +303,8 @@ fn onset_envelope(audio: &[f32], sample_rate_hz: u32) -> Result<Envelope, String
 }
 
 fn macro_flux(bands: &[f32], half: usize) -> Vec<Vec<f64>> {
-    let frames = bands.len() / NOVELTY_BANDS;
-    let per = NOVELTY_BANDS / MACRO_BANDS;
+    let frames = bands.len() / BANDS;
+    let per = BANDS / MACRO_BANDS;
     (0..MACRO_BANDS)
         .map(|m| {
             let raw: Vec<f64> = (0..frames)
@@ -317,8 +314,7 @@ fn macro_flux(bands: &[f32], half: usize) -> Vec<Vec<f64>> {
                     }
                     (m * per..(m + 1) * per)
                         .map(|b| {
-                            let d =
-                                bands[f * NOVELTY_BANDS + b] - bands[(f - 1) * NOVELTY_BANDS + b];
+                            let d = bands[f * BANDS + b] - bands[(f - 1) * BANDS + b];
                             f64::from(d.max(0.0))
                         })
                         .sum()
@@ -329,12 +325,12 @@ fn macro_flux(bands: &[f32], half: usize) -> Vec<Vec<f64>> {
         .collect()
 }
 
-/// `NOVELTY_BANDS + 1` log-spaced bin edges from 40 Hz to `max_bin`.
+/// `BANDS + 1` log-spaced bin edges from 40 Hz to `max_bin`.
 fn band_edges(sr: f64, n: usize, max_bin: usize) -> Vec<usize> {
     let lo = (40.0 / sr * n as f64).max(1.0);
     let hi = max_bin as f64;
-    (0..=NOVELTY_BANDS)
-        .map(|i| (lo * (hi / lo).powf(i as f64 / NOVELTY_BANDS as f64)).round() as usize)
+    (0..=BANDS)
+        .map(|i| (lo * (hi / lo).powf(i as f64 / BANDS as f64)).round() as usize)
         .map(|b| b.min(max_bin - 1))
         .collect()
 }
@@ -548,53 +544,6 @@ fn phase_candidates(env: &Envelope, period: f64) -> Vec<f64> {
     out
 }
 
-/// Section changes (drops, breakdowns, phrase starts) land on beats and
-/// usually on downbeats. Spectral novelty is the L1 change in mean log band
-/// energy across a two-beat window.
-fn novelty_curve(env: &Envelope, period: f64) -> Vec<f64> {
-    let frames = env.bands.len() / NOVELTY_BANDS;
-    let w = ((period * 2.0 / env.hop_sec).round() as usize).max(2);
-    let mut prefix = vec![0.0f64; (frames + 1) * NOVELTY_BANDS];
-    for f in 0..frames {
-        for b in 0..NOVELTY_BANDS {
-            prefix[(f + 1) * NOVELTY_BANDS + b] =
-                prefix[f * NOVELTY_BANDS + b] + f64::from(env.bands[f * NOVELTY_BANDS + b]);
-        }
-    }
-    let mean = |a: usize, b: usize, band: usize| {
-        (prefix[b * NOVELTY_BANDS + band] - prefix[a * NOVELTY_BANDS + band]) / (b - a) as f64
-    };
-    (0..frames)
-        .map(|f| {
-            if f < w || f + w > frames {
-                return 0.0;
-            }
-            (0..NOVELTY_BANDS)
-                .map(|b| (mean(f, f + w, b) - mean(f - w, f, b)).abs())
-                .sum()
-        })
-        .collect()
-}
-
-/// Sum of novelty at `phase + k * stride` (linear interpolation).
-fn novelty_comb(env: &Envelope, novelty: &[f64], phase: f64, stride: f64) -> f64 {
-    let mut total = 0.0;
-    let mut t = phase;
-    loop {
-        let x = (t - env.t0_sec) / env.hop_sec;
-        if x >= (novelty.len() - 1) as f64 {
-            break;
-        }
-        if x >= 0.0 {
-            let i = x as usize;
-            let frac = x - i as f64;
-            total += novelty[i] * (1.0 - frac) + novelty[i + 1] * frac;
-        }
-        t += stride;
-    }
-    total
-}
-
 /// Score each candidate by onset strength at its beat positions in four
 /// frequency bands, combined as a geometric mean of each band's lift over its
 /// average. A real beat tends to carry onsets across the spectrum; off-beat
@@ -643,20 +592,158 @@ fn beat_mean(env: &Envelope, x: &[f64], phase: f64, period: f64) -> f64 {
     }
 }
 
-/// Pick which of the 4 beats in a measure starts it, by novelty. Returns the
-/// beat rotation and the winner's share of the total.
-fn choose_downbeat(env: &Envelope, novelty: &[f64], g: Grid) -> (usize, f64) {
-    let scores: Vec<f64> = (0..4)
-        .map(|r| novelty_comb(env, novelty, g.phase + r as f64 * g.period, 4.0 * g.period))
+// ---------------------------------------------------------------------------
+// Measure placement
+
+/// Pick which of the 4 beats in a measure starts it (4/4 assumed). Chords
+/// and bass notes tend to change on downbeats and the kick tends to accent
+/// them, so each rotation is scored by harmonic change (chroma, 4-beat
+/// windows), bass-note change (2-beat windows) and kick-band onset strength,
+/// each z-scored across the four rotations. Returns the rotation and its
+/// margin over the runner-up (in summed z units).
+fn choose_downbeat(audio: &[f32], sr: u32, env: &Envelope, g: Grid) -> (usize, f64) {
+    let beats = beat_pitch_profiles(audio, sr, g);
+    let n = beats.chroma.len();
+    if n < 16 {
+        return (0, 0.0);
+    }
+    let chroma = window_change(&beats.chroma, 4);
+    let bass = window_change(&beats.bass, 2);
+    let low = &env.macro_flux[0];
+    let low_mean = low.iter().sum::<f64>() / low.len().max(1) as f64 + 1e-9;
+    let half = (0.025 / env.hop_sec).round() as isize;
+    let kick: Vec<f64> = (0..n)
+        .map(|k| {
+            let c = ((g.beat_time(k) - env.t0_sec) / env.hop_sec).round() as isize;
+            let a = (c - half).max(0) as usize;
+            let b = ((c + half + 1).max(0) as usize).min(low.len());
+            low[a.min(b)..b].iter().copied().fold(0.0, f64::max) / low_mean
+        })
         .collect();
-    let total: f64 = scores.iter().sum();
-    let (best, score) = scores
-        .iter()
-        .copied()
-        .enumerate()
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-        .unwrap_or((0, 0.0));
-    (best, if total > 0.0 { score / total } else { 0.25 })
+    let mut total = [0.0; 4];
+    for cue in [&chroma, &bass, &kick] {
+        let mut by_rot = [0.0; 4];
+        let mut counts = [0usize; 4];
+        for (k, v) in cue.iter().enumerate() {
+            by_rot[k % 4] += v;
+            counts[k % 4] += 1;
+        }
+        for r in 0..4 {
+            by_rot[r] /= counts[r].max(1) as f64;
+        }
+        let mean = by_rot.iter().sum::<f64>() / 4.0;
+        let sd = (by_rot.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / 4.0).sqrt() + 1e-9;
+        for r in 0..4 {
+            total[r] += (by_rot[r] - mean) / sd;
+        }
+    }
+    let mut order = [0usize, 1, 2, 3];
+    order.sort_by(|a, b| total[*b].total_cmp(&total[*a]));
+    (order[0], total[order[0]] - total[order[1]])
+}
+
+struct BeatProfiles {
+    /// Per-beat mean chroma (80 Hz - 4 kHz).
+    chroma: Vec<[f64; 12]>,
+    /// Per-beat mean bass chroma (30 - 200 Hz).
+    bass: Vec<[f64; 12]>,
+}
+
+/// Long-window STFT folded to pitch classes, averaged over each beat span.
+fn beat_pitch_profiles(audio: &[f32], sr: u32, g: Grid) -> BeatProfiles {
+    let srf = f64::from(sr);
+    let n = 1usize << (srf * PITCH_WINDOW_SEC).log2().round() as u32;
+    let hop = ((srf * PITCH_HOP_SEC).round() as usize).max(1);
+    let empty = BeatProfiles {
+        chroma: Vec::new(),
+        bass: Vec::new(),
+    };
+    if audio.len() < n + hop {
+        return empty;
+    }
+    let pitch_class = |k: usize, lo: f64, hi: f64| -> Option<usize> {
+        let f = k as f64 * srf / n as f64;
+        (f >= lo && f <= hi)
+            .then(|| ((12.0 * (f / 440.0).log2()).round() as i64 + 9).rem_euclid(12) as usize)
+    };
+    let bins = n / 2 + 1;
+    let chroma_pc: Vec<Option<usize>> = (0..bins).map(|k| pitch_class(k, 80.0, 4000.0)).collect();
+    let bass_pc: Vec<Option<usize>> = (0..bins).map(|k| pitch_class(k, 30.0, 200.0)).collect();
+    let last_bin = chroma_pc.iter().rposition(Option::is_some).unwrap_or(0) + 1;
+    let window: Vec<f64> = (0..n)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos())
+        .collect();
+    let fft = FftPlanner::<f64>::new().plan_fft_forward(n);
+    let mut buf = vec![Complex::new(0.0, 0.0); n];
+    let mut scratch = vec![Complex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
+
+    let beats = ((audio.len() as f64 / srf - g.phase) / g.period)
+        .floor()
+        .max(0.0) as usize;
+    let beats = beats.saturating_sub(1);
+    let mut chroma = vec![[0.0; 12]; beats];
+    let mut bass = vec![[0.0; 12]; beats];
+    let mut counts = vec![0usize; beats];
+    let frames = (audio.len() - n) / hop + 1;
+    for f in 0..frames {
+        let center = (f * hop) as f64 / srf + n as f64 * 0.5 / srf;
+        let k = (center - g.phase) / g.period;
+        if k < 0.0 || k as usize >= beats {
+            continue;
+        }
+        let k = k as usize;
+        let start = f * hop;
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = Complex::new(f64::from(audio[start + i]) * window[i], 0.0);
+        }
+        fft.process_with_scratch(&mut buf, &mut scratch);
+        for bin in 0..last_bin {
+            let m = buf[bin].norm().sqrt();
+            if let Some(pc) = chroma_pc[bin] {
+                chroma[k][pc] += m;
+            }
+            if let Some(pc) = bass_pc[bin] {
+                bass[k][pc] += m;
+            }
+        }
+        counts[k] += 1;
+    }
+    for k in 0..beats {
+        let c = counts[k].max(1) as f64;
+        for pc in 0..12 {
+            chroma[k][pc] /= c;
+            bass[k][pc] /= c;
+        }
+    }
+    BeatProfiles { chroma, bass }
+}
+
+/// Cosine distance between the mean profile of the `w` beats before beat k
+/// and the `w` beats from k on (0 where the windows don't fit).
+fn window_change(profiles: &[[f64; 12]], w: usize) -> Vec<f64> {
+    let n = profiles.len();
+    let mut prefix = vec![[0.0; 12]; n + 1];
+    for (k, p) in profiles.iter().enumerate() {
+        for pc in 0..12 {
+            prefix[k + 1][pc] = prefix[k][pc] + p[pc];
+        }
+    }
+    (0..n)
+        .map(|k| {
+            if k < w || k + w > n {
+                return 0.0;
+            }
+            let (mut dot, mut na, mut nb) = (0.0, 0.0, 0.0);
+            let (lo, mid, hi) = (&prefix[k - w], &prefix[k], &prefix[k + w]);
+            for ((l, m), h) in lo.iter().zip(mid).zip(hi) {
+                let (a, b) = (m - l, h - m);
+                dot += a * b;
+                na += a * a;
+                nb += b * b;
+            }
+            1.0 - dot / (na.sqrt() * nb.sqrt() + 1e-9)
+        })
+        .collect()
 }
 
 /// Per-block bias vs beat index; the slope is the per-beat period error.
