@@ -277,18 +277,52 @@ dependencies = [
 
 [[package]]
 name = "null-or-die"
-version = "0.0.22"
+version = "0.1.2"
+dependencies = [
+ "null-or-die-cli",
+ "null-or-die-core",
+ "null-or-die-rssp",
+]
+
+[[package]]
+name = "null-or-die-audio"
+version = "0.1.2"
+dependencies = [
+ "lewton",
+]
+
+[[package]]
+name = "null-or-die-cli"
+version = "0.1.2"
 dependencies = [
  "clap",
- "lewton",
  "md5",
+ "null-or-die-audio",
+ "null-or-die-core",
+ "null-or-die-rssp",
  "png",
  "rssp",
- "rustfft",
  "serde",
  "serde_json",
  "walkdir",
  "zstd",
+]
+
+[[package]]
+name = "null-or-die-core"
+version = "0.1.2"
+dependencies = [
+ "rustfft",
+ "serde",
+]
+
+[[package]]
+name = "null-or-die-rssp"
+version = "0.1.2"
+dependencies = [
+ "null-or-die-audio",
+ "null-or-die-core",
+ "rssp",
 ]
 
 [[package]]
