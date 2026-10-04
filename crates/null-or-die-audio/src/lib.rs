@@ -35,6 +35,68 @@ pub fn decode_ogg_mono_like_python(path: &Path) -> Result<OggDecode, String> {
     }
 }
 
+/// Decode any audio file to mono. OGG goes through the parity-matched path;
+/// everything else (mp3, m4a, flac, wav, ...) is decoded with ffmpeg.
+pub fn decode_audio_mono(path: &Path) -> Result<OggDecode, String> {
+    let is_ogg = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("ogg"));
+    let ogg_err = if is_ogg {
+        match decode_ogg_mono_like_python(path) {
+            Ok(decoded) => return Ok(decoded),
+            Err(e) => Some(e),
+        }
+    } else {
+        None
+    };
+    let (sample_rate_hz, channels) = probe_ffmpeg_stream(path)?;
+    decode_ogg_ffmpeg(path, sample_rate_hz, channels).map_err(|e| match ogg_err {
+        Some(ogg) => format!("{ogg}; ffmpeg fallback failed: {e}"),
+        None => e,
+    })
+}
+
+fn probe_ffmpeg_stream(path: &Path) -> Result<(u32, usize), String> {
+    let output = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "a:0"])
+        .args([
+            "-show_entries",
+            "stream=sample_rate,channels",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("ffprobe {} failed: {e}", path.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "ffprobe {} failed: {}",
+            path.display(),
+            stderr.trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut parts = text.trim().split(',');
+    let parse_err = || {
+        format!(
+            "ffprobe {}: unexpected output {:?}",
+            path.display(),
+            text.trim()
+        )
+    };
+    let sample_rate_hz = parts
+        .next()
+        .and_then(|v| v.trim().parse().ok())
+        .ok_or_else(parse_err)?;
+    let channels = parts
+        .next()
+        .and_then(|v| v.trim().parse().ok())
+        .ok_or_else(parse_err)?;
+    Ok((sample_rate_hz, channels))
+}
+
 fn decoder_pref() -> Option<String> {
     std::env::var("NOD_AUDIO_DECODER")
         .ok()

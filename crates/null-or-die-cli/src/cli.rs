@@ -25,6 +25,7 @@ pub enum Command {
     Harness(HarnessCmd),
     Bench(BenchCmd),
     Plot(PlotCmd),
+    Grid(GridCmd),
 }
 
 #[derive(Debug, Parser)]
@@ -156,6 +157,54 @@ pub struct HarnessCmd {
     pub full_spectrogram: bool,
 }
 
+/// Detect a constant-BPM grid from raw audio and optionally write a minimal .ssc.
+#[derive(Debug, Parser)]
+pub struct GridCmd {
+    /// Audio file (ogg, mp3, m4a, flac, wav, ... anything ffmpeg decodes).
+    pub audio_path: PathBuf,
+
+    /// Write a minimal .ssc here (MUSIC is the audio file name, so put it next to the audio).
+    #[arg(long)]
+    pub ssc: Option<PathBuf>,
+
+    /// Overwrite an existing .ssc.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Write the JSON report here instead of stdout.
+    #[arg(short = 'o', long)]
+    pub output: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 100.0)]
+    pub min_bpm: f64,
+
+    /// Upper bound of the BPM search range (inclusive).
+    #[arg(long, default_value_t = 200.0)]
+    pub max_bpm: f64,
+
+    /// Skip tempo search and refine from this BPM.
+    #[arg(long = "bpm")]
+    pub bpm_hint: Option<f64>,
+
+    /// Snap to an integer BPM when that moves the last beat by at most this many ms.
+    #[arg(long, default_value_t = 3.0)]
+    pub snap_ms: f64,
+
+    /// Sync paradigm for the written offset: "null" or "itg" (+9 ms).
+    #[arg(long, default_value = "null")]
+    pub paradigm: String,
+
+    /// Include a Beginner dance-single chart with a tap on every beat.
+    #[arg(long)]
+    pub beat_chart: bool,
+
+    #[arg(long)]
+    pub title: Option<String>,
+
+    #[arg(long)]
+    pub artist: Option<String>,
+}
+
 #[derive(Debug, Parser)]
 pub struct PlotCmd {
     pub input_json: PathBuf,
@@ -219,7 +268,7 @@ fn rewrite_legacy_args(argv: Vec<OsString>) -> Result<Vec<OsString>, String> {
 fn has_subcommand(arg: Option<&OsString>) -> bool {
     matches!(
         arg.map(|v| v.to_string_lossy().to_string()),
-        Some(cmd) if matches!(cmd.as_str(), "analyze" | "parity" | "harness" | "bench" | "plot")
+        Some(cmd) if matches!(cmd.as_str(), "analyze" | "parity" | "harness" | "bench" | "plot" | "grid")
     )
 }
 

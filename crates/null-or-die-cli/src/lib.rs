@@ -2,6 +2,7 @@ mod analyze;
 mod bench;
 mod cli;
 mod fs_scan;
+mod grid;
 mod harness;
 mod model;
 mod parity;
@@ -59,6 +60,10 @@ pub fn run() -> Result<(), String> {
         }
         cli::Command::Bench(args) => {
             let report = bench::run(&args)?;
+            write_json(&report, args.output.as_deref())
+        }
+        cli::Command::Grid(args) => {
+            let report = grid::run(&args)?;
             write_json(&report, args.output.as_deref())
         }
         cli::Command::Plot(args) => {
